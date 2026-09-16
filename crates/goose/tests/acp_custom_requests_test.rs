@@ -1253,6 +1253,136 @@ fn test_custom_canonical_model_info_none_when_provider_reports_default_limit() {
     });
 }
 
+#[test]
+#[serial]
+fn test_custom_canonical_model_info_probes_custom_provider_for_canonical_model() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: Some(262_144),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        // "llama-3.3-70b-instruct" infers to meta-llama (128k) in the bundled
+        // registry, but a custom provider's live allocation must win.
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "custom_lemonade", "model": "llama-3.3-70b-instruct" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(
+            response
+                .get("modelInfo")
+                .and_then(|info| info.get("contextLimit")),
+            Some(&serde_json::json!(262_144))
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_canonical_model_info_falls_back_to_registry_when_probe_reports_default() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: None,
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "custom_lemonade", "model": "llama-3.3-70b-instruct" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(
+            response
+                .get("modelInfo")
+                .and_then(|info| info.get("contextLimit")),
+            Some(&serde_json::json!(128_000))
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_canonical_model_info_uses_registry_for_first_party_provider() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                // A probed value would be 999_999; the registry's 400_000 must
+                // win for first-party providers, proving no probe happens.
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: Some(999_999),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "openai", "model": "gpt-5" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(
+            response
+                .get("modelInfo")
+                .and_then(|info| info.get("contextLimit")),
+            Some(&serde_json::json!(400_000))
+        );
+    });
+}
+
 const APP_TOOL: &str = "mcp-fixture__get_code";
 
 async fn connect_with_mcp_fixture(mcp_url: &str, mode: &str) -> (AcpServerConnection, String) {

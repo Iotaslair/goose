@@ -1219,6 +1219,13 @@ impl GooseAcpAgent {
         (limit != goose_providers::model::DEFAULT_CONTEXT_LIMIT).then_some(limit)
     }
 
+    /// Custom and local-inference providers serve models whose live server
+    /// allocation can differ from the catalog's static capability, so the
+    /// catalog context limit is only a fallback for them.
+    fn is_catalog_context_fallback(provider: &str) -> bool {
+        provider.starts_with("custom_") || matches!(provider, "ollama" | "local")
+    }
+
     pub(super) async fn on_canonical_model_info(
         &self,
         req: CanonicalModelInfoRequest,
@@ -1240,11 +1247,21 @@ impl GooseAcpAgent {
             let pricing =
                 crate::providers::canonical_cost::resolve_pricing(&req.provider, &req.model)
                     .unwrap_or_else(|| canonical_model.cost.clone());
+            // A catalog match is static model capability; custom and
+            // local-inference providers serve a live server-allocated window,
+            // so probe first and keep the catalog value only as fallback.
+            let context_limit = if Self::is_catalog_context_fallback(&req.provider) {
+                self.probed_context_limit(&req.provider, &req.model)
+                    .await
+                    .unwrap_or(canonical_model.limit.context)
+            } else {
+                canonical_model.limit.context
+            };
             return Ok(CanonicalModelInfoResponse {
                 model_info: Some(CanonicalModelInfoDto {
                     provider: req.provider.clone(),
                     model: req.model.clone(),
-                    context_limit: canonical_model.limit.context,
+                    context_limit,
                     max_output_tokens: canonical_model.limit.output,
                     reasoning: canonical_model
                         .reasoning
