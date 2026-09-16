@@ -50,6 +50,7 @@ struct MockProvider {
     name: String,
     recommended_models: Vec<String>,
     supported_models: Result<Vec<String>, ProviderError>,
+    context_limit: Option<usize>,
 }
 
 #[async_trait::async_trait]
@@ -77,6 +78,11 @@ impl Provider for MockProvider {
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         self.supported_models.clone()
+    }
+
+    async fn get_context_limit(&self, _model: &str, _override_limit: Option<usize>) -> usize {
+        self.context_limit
+            .unwrap_or(goose_providers::model::DEFAULT_CONTEXT_LIMIT)
     }
 }
 
@@ -1054,6 +1060,7 @@ fn test_custom_provider_supported_models_lists_raw_provider_models() {
                             "goose-claude-opus-4-8".to_string(),
                             "raw-databricks-endpoint".to_string(),
                         ]),
+                        context_limit: None,
                     }) as Arc<dyn Provider>)
                 })
             },
@@ -1101,6 +1108,7 @@ fn test_custom_provider_supported_models_maps_not_configured_error() {
                     name: provider_name,
                     recommended_models: Vec::new(),
                     supported_models: Err(ProviderError::NotConfigured),
+                    context_limit: None,
                 }) as Arc<dyn Provider>)
             })
         });
@@ -1140,6 +1148,7 @@ fn test_custom_provider_supported_models_maps_authentication_error() {
                     supported_models: Err(ProviderError::Authentication(
                         "credentials rejected".to_string(),
                     )),
+                    context_limit: None,
                 }) as Arc<dyn Provider>)
             })
         });
@@ -1162,6 +1171,85 @@ fn test_custom_provider_supported_models_maps_authentication_error() {
 
         assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
         assert!(error.to_string().contains("credentials rejected"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_canonical_model_info_probes_provider_for_unknown_model() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: Some(262_144),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "lemonade", "model": "gemma" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(
+            response
+                .get("modelInfo")
+                .and_then(|info| info.get("contextLimit")),
+            Some(&serde_json::json!(262_144))
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_canonical_model_info_none_when_provider_reports_default_limit() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: None,
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "lemonade", "model": "gemma" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(response.get("modelInfo"), None);
     });
 }
 

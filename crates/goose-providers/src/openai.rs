@@ -588,9 +588,10 @@ impl OpenAiProvider {
         parse_model_ids(&json)
     }
 
-    /// llama.cpp and Ollama expose the actual allocated context window in the
-    /// non-standard `meta.n_ctx` field of `/v1/models`. Returns `None` when absent
-    /// (e.g. real OpenAI).
+    /// Probe `/v1/models` for the context window the server can actually
+    /// work with for `model_name` (`meta.n_ctx` on llama.cpp/Ollama,
+    /// `context_length` or the configured `recipe_options.ctx_size` on
+    /// Lemonade). Returns `None` when absent (e.g. real OpenAI).
     async fn fetch_n_ctx_from_api(&self, model_name: &str) -> Result<Option<usize>, ProviderError> {
         let models_path =
             Self::map_base_path(&self.base_path, "models", OPEN_AI_DEFAULT_MODELS_PATH);
@@ -625,15 +626,25 @@ fn parse_model_ids(json: &serde_json::Value) -> Result<Vec<String>, ProviderErro
     Ok(model_ids)
 }
 
-/// Extract `meta.n_ctx` for `model_name` from a `/v1/models` response body.
+/// Extract the working context window for `model_name` from a `/v1/models` response body.
+///
+/// Servers expose this in different shapes: llama.cpp and Ollama use the
+/// non-standard `meta.n_ctx`, while Lemonade (and LM Studio) use top-level
+/// `context_length` (loaded context) and Lemonade adds
+/// `recipe_options.ctx_size` (the context a model loads with). Static
+/// capability fields such as `max_context_window` are deliberately ignored:
+/// the server can only work with what is configured/loaded, so the most
+/// specific working-window value present wins.
 fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option<usize> {
     let data = json.get("data")?.as_array()?;
 
-    let n_ctx = |entry: &serde_json::Value| -> Option<usize> {
+    let context_limit = |entry: &serde_json::Value| -> Option<usize> {
         entry
-            .get("meta")?
-            .get("n_ctx")?
-            .as_u64()
+            .get("meta")
+            .and_then(|meta| meta.get("n_ctx"))
+            .or_else(|| entry.get("context_length"))
+            .or_else(|| entry.get("recipe_options").and_then(|o| o.get("ctx_size")))
+            .and_then(|value| value.as_u64())
             .map(|v| v as usize)
     };
 
@@ -641,14 +652,14 @@ fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option
         .iter()
         .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(model_name))
     {
-        return n_ctx(entry);
+        return context_limit(entry);
     }
 
     // For single-model servers without --alias, llama.cpp reports the loaded model
     // file path as id rather than the client's alias, so no entry matches above.
-    // Fall back to the sole entry's n_ctx.
+    // Fall back to the sole entry's context limit.
     match data.as_slice() {
-        [only] => n_ctx(only),
+        [only] => context_limit(only),
         _ => None,
     }
 }
@@ -1447,6 +1458,98 @@ mod tests {
             ]
         });
         assert_eq!(parse_n_ctx_from_models(&body, "model-c"), None);
+    }
+
+    #[test]
+    fn parse_n_ctx_reads_lemonade_context_length() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "gemma",
+                    "object": "model",
+                    "owned_by": "lemonade",
+                    "context_length": 50_000,
+                    "max_context_window": 262_144,
+                    "recipe_options": { "ctx_size": 50_000 }
+                }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "gemma"), Some(50_000));
+    }
+
+    #[test]
+    fn parse_n_ctx_reads_lemonade_ctx_size_when_unloaded() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "gemma",
+                    "object": "model",
+                    "max_context_window": 262_144,
+                    "recipe_options": { "ctx_size": 50_000 }
+                },
+                {
+                    "id": "muse",
+                    "object": "model",
+                    "max_context_window": 131_072,
+                    "recipe_options": { "ctx_size": 131_072 }
+                }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "gemma"), Some(50_000));
+        assert_eq!(parse_n_ctx_from_models(&body, "muse"), Some(131_072));
+    }
+
+    #[test]
+    fn parse_n_ctx_prefers_loaded_context_over_configured() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "m",
+                    "context_length": 32_768,
+                    "recipe_options": { "ctx_size": 131_072 }
+                }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "m"), Some(32_768));
+    }
+
+    #[test]
+    fn parse_n_ctx_ignores_static_max_window() {
+        let body = json!({
+            "data": [
+                { "id": "gemma", "object": "model", "max_context_window": 262_144 }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "gemma"), None);
+    }
+
+    #[test]
+    fn parse_n_ctx_meta_n_ctx_beats_lemonade_fields() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "m",
+                    "meta": { "n_ctx": 16_384 },
+                    "context_length": 8192,
+                    "recipe_options": { "ctx_size": 131_072 }
+                }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "m"), Some(16_384));
+    }
+
+    #[test]
+    fn parse_n_ctx_lemonade_falls_back_to_sole_entry_when_id_differs() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "some/other/alias",
+                    "max_context_window": 262_144,
+                    "recipe_options": { "ctx_size": 50_000 }
+                }
+            ]
+        });
+        assert_eq!(parse_n_ctx_from_models(&body, "qwen3"), Some(50_000));
     }
 
     #[test]
