@@ -84,6 +84,10 @@ impl Provider for MockProvider {
         self.context_limit
             .unwrap_or(goose_providers::model::DEFAULT_CONTEXT_LIMIT)
     }
+
+    async fn probe_context_limit(&self, _model: &str) -> Option<usize> {
+        self.context_limit
+    }
 }
 
 fn active_run_id_from_update(update: &SessionUpdate) -> Option<String> {
@@ -1218,7 +1222,7 @@ fn test_custom_canonical_model_info_probes_provider_for_unknown_model() {
 
 #[test]
 #[serial]
-fn test_custom_canonical_model_info_none_when_provider_reports_default_limit() {
+fn test_custom_canonical_model_info_none_when_provider_reports_no_limit() {
     write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
     run_test(async move {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
@@ -1299,7 +1303,52 @@ fn test_custom_canonical_model_info_probes_custom_provider_for_canonical_model()
 
 #[test]
 #[serial]
-fn test_custom_canonical_model_info_falls_back_to_registry_when_probe_reports_default() {
+fn test_custom_canonical_model_info_preserves_discovered_limit_matching_default() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async move {
+        let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;
+        let provider_factory: AcpProviderFactory = Arc::new(|provider_name, _, _, _| {
+            Box::pin(async move {
+                Ok(Arc::new(MockProvider {
+                    name: provider_name,
+                    recommended_models: Vec::new(),
+                    supported_models: Ok(vec![]),
+                    context_limit: Some(128_000),
+                }) as Arc<dyn Provider>)
+            })
+        });
+        let conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                provider_factory: Some(provider_factory),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        // "gpt-5" carries a 400k catalog limit, but a live allocation of
+        // exactly 128k (the global default) must be preserved, not replaced
+        // by the catalog value.
+        let response = send_custom(
+            conn.cx(),
+            "_goose/unstable/providers/canonical-model-info",
+            serde_json::json!({ "provider": "custom_lemonade", "model": "gpt-5" }),
+        )
+        .await
+        .expect("canonical model info should succeed");
+
+        assert_eq!(
+            response
+                .get("modelInfo")
+                .and_then(|info| info.get("contextLimit")),
+            Some(&serde_json::json!(128_000))
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_custom_canonical_model_info_falls_back_to_registry_when_probe_reports_nothing() {
     write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
     run_test(async move {
         let openai = OpenAiFixture::new(vec![], Arc::new(EnforceSessionId::default())).await;

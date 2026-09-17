@@ -664,6 +664,52 @@ fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option
     }
 }
 
+impl OpenAiProvider {
+    fn context_limit_resolver(&self) -> goose_provider_types::context_limit::ContextLimitResolver {
+        let configured_limits = self
+            .custom_models
+            .iter()
+            .flatten()
+            .filter_map(|model| model.context_limit.map(|limit| (model.name.clone(), limit)));
+        goose_provider_types::context_limit::ContextLimitResolver::new(&self.name)
+            .with_configured_limits(configured_limits)
+    }
+
+    /// Discover the context window the server reports for `model` (with
+    /// caching). `Ok(None)` means the server reports nothing.
+    async fn discover_context_limit(&self, model: &str) -> Result<Option<usize>, ProviderError> {
+        if let Some(cached) = self
+            .n_ctx_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(model).copied())
+            .and_then(CachedContextLimit::value)
+        {
+            return Ok(cached);
+        }
+
+        let probed =
+            match tokio::time::timeout(N_CTX_PROBE_TIMEOUT, self.fetch_n_ctx_from_api(model)).await
+            {
+                Ok(Ok(limit)) => Ok(limit),
+                Ok(Err(error)) if error.is_endpoint_not_found() => Ok(None),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(ProviderError::RequestFailed(
+                    "Context-limit discovery timed out".into(),
+                )),
+            };
+
+        if let Ok(mut cache) = self.n_ctx_cache.lock() {
+            let cached = match probed.as_ref() {
+                Ok(limit) => CachedContextLimit::Success(*limit),
+                Err(_) => CachedContextLimit::Failure(Instant::now()),
+            };
+            cache.insert(model.to_string(), cached);
+        }
+        probed
+    }
+}
+
 impl ProviderDescriptor for OpenAiProvider {
     fn metadata() -> ProviderMetadata {
         let models = OPEN_AI_KNOWN_MODELS
@@ -727,49 +773,14 @@ impl Provider for OpenAiProvider {
     }
 
     async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
-        let configured_limits = self
-            .custom_models
-            .iter()
-            .flatten()
-            .filter_map(|model| model.context_limit.map(|limit| (model.name.clone(), limit)));
-        let resolver = goose_provider_types::context_limit::ContextLimitResolver::new(&self.name)
-            .with_configured_limits(configured_limits);
+        self.context_limit_resolver()
+            .resolve(model, override_limit, || self.discover_context_limit(model))
+            .await
+    }
 
-        resolver
-            .resolve(model, override_limit, || async {
-                if let Some(cached) = self
-                    .n_ctx_cache
-                    .lock()
-                    .ok()
-                    .and_then(|cache| cache.get(model).copied())
-                    .and_then(CachedContextLimit::value)
-                {
-                    return Ok(cached);
-                }
-
-                let probed = match tokio::time::timeout(
-                    N_CTX_PROBE_TIMEOUT,
-                    self.fetch_n_ctx_from_api(model),
-                )
-                .await
-                {
-                    Ok(Ok(limit)) => Ok(limit),
-                    Ok(Err(error)) if error.is_endpoint_not_found() => Ok(None),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(ProviderError::RequestFailed(
-                        "Context-limit discovery timed out".into(),
-                    )),
-                };
-
-                if let Ok(mut cache) = self.n_ctx_cache.lock() {
-                    let cached = match probed.as_ref() {
-                        Ok(limit) => CachedContextLimit::Success(*limit),
-                        Err(_) => CachedContextLimit::Failure(Instant::now()),
-                    };
-                    cache.insert(model.to_string(), cached);
-                }
-                probed
-            })
+    async fn probe_context_limit(&self, model: &str) -> Option<usize> {
+        self.context_limit_resolver()
+            .resolve_provider_reported(model, None, || self.discover_context_limit(model))
             .await
     }
 

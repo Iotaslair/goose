@@ -1215,8 +1215,7 @@ impl GooseAcpAgent {
                 return None;
             }
         };
-        let limit = provider.get_context_limit(model, None).await;
-        (limit != goose_providers::model::DEFAULT_CONTEXT_LIMIT).then_some(limit)
+        provider.probe_context_limit(model).await
     }
 
     /// Custom and local-inference providers serve models whose live server
