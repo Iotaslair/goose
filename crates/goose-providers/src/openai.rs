@@ -638,14 +638,24 @@ fn parse_model_ids(json: &serde_json::Value) -> Result<Vec<String>, ProviderErro
 fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option<usize> {
     let data = json.get("data")?.as_array()?;
 
-    let context_limit = |entry: &serde_json::Value| -> Option<usize> {
-        entry
-            .get("meta")
-            .and_then(|meta| meta.get("n_ctx"))
-            .or_else(|| entry.get("context_length"))
-            .or_else(|| entry.get("recipe_options").and_then(|o| o.get("ctx_size")))
-            .and_then(|value| value.as_u64())
+    let parse_window = |value: Option<&serde_json::Value>| -> Option<usize> {
+        value
+            .and_then(|v| {
+                v.as_u64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+                        .map(|f| f as u64)
+                })
+            })
             .map(|v| v as usize)
+    };
+    // Parse each source separately so a present-but-unparseable field (float,
+    // null, string) falls through to the next source instead of failing the
+    // whole lookup.
+    let context_limit = |entry: &serde_json::Value| -> Option<usize> {
+        parse_window(entry.get("meta").and_then(|meta| meta.get("n_ctx")))
+            .or_else(|| parse_window(entry.get("context_length")))
+            .or_else(|| parse_window(entry.get("recipe_options").and_then(|o| o.get("ctx_size"))))
     };
 
     if let Some(entry) = data
@@ -1522,6 +1532,35 @@ mod tests {
             ]
         });
         assert_eq!(parse_n_ctx_from_models(&body, "m"), Some(32_768));
+    }
+
+    #[test]
+    fn parse_n_ctx_falls_through_unparseable_fields() {
+        let body = json!({
+            "data": [
+                {
+                    "id": "float",
+                    "context_length": 8192.0,
+                    "recipe_options": { "ctx_size": 50_000 }
+                },
+                {
+                    "id": "null",
+                    "context_length": null,
+                    "recipe_options": { "ctx_size": 32_000 }
+                },
+                {
+                    "id": "string",
+                    "meta": { "n_ctx": "4096" },
+                    "context_length": 64_000
+                }
+            ]
+        });
+        // Integral float is a valid window.
+        assert_eq!(parse_n_ctx_from_models(&body, "float"), Some(8192));
+        // null context_length falls through to recipe_options.ctx_size.
+        assert_eq!(parse_n_ctx_from_models(&body, "null"), Some(32_000));
+        // string n_ctx falls through to context_length.
+        assert_eq!(parse_n_ctx_from_models(&body, "string"), Some(64_000));
     }
 
     #[test]

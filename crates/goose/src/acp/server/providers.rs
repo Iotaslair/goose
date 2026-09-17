@@ -1280,14 +1280,20 @@ impl GooseAcpAgent {
             else {
                 return Ok(CanonicalModelInfoResponse { model_info: None });
             };
-            // Config-declared limits win; otherwise probe the provider before
-            // falling back to the default.
+            // Config-declared limits win. Live/local providers report their
+            // server-allocated window, so probe those; catalog providers go
+            // straight to the default (probing a built-in provider would
+            // re-hit its endpoint on every request).
             let context_limit = match info.context_limit {
                 Some(limit) => limit,
-                None => self
-                    .probed_context_limit(&req.provider, &req.model)
-                    .await
-                    .unwrap_or_else(|| ModelConfig::new(&req.model).context_limit()),
+                None => {
+                    let probed = if Self::is_catalog_context_fallback(&req.provider) {
+                        self.probed_context_limit(&req.provider, &req.model).await
+                    } else {
+                        None
+                    };
+                    probed.unwrap_or_else(|| ModelConfig::new(&req.model).context_limit())
+                }
             };
             return Ok(CanonicalModelInfoResponse {
                 model_info: Some(CanonicalModelInfoDto {
